@@ -145,3 +145,173 @@
       )
       ERR_MARKET_EXPIRED
     )
+
+    ;; Validate Prediction Parameters
+    (asserts! (or (is-eq direction "bullish") (is-eq direction "bearish"))
+      ERR_INVALID_DIRECTION
+    )
+    (asserts! (>= stake-amount (var-get min-stake-amount)) ERR_INVALID_INPUT)
+    (asserts! (<= stake-amount (stx-get-balance tx-sender))
+      ERR_INSUFFICIENT_FUNDS
+    )
+
+    ;; Transfer Stake to Contract
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+
+    ;; Record User Position
+    (map-set participant-positions {
+      market-id: market-id,
+      participant: tx-sender,
+    } {
+      direction: direction,
+      amount: stake-amount,
+      rewards-claimed: false,
+    })
+
+    ;; Update Market Pools
+    (map-set prediction-markets market-id
+      (merge market-data {
+        bullish-pool: (if (is-eq direction "bullish")
+          (+ (get bullish-pool market-data) stake-amount)
+          (get bullish-pool market-data)
+        ),
+        bearish-pool: (if (is-eq direction "bearish")
+          (+ (get bearish-pool market-data) stake-amount)
+          (get bearish-pool market-data)
+        ),
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Claim Prediction Rewards
+(define-public (claim-rewards (market-id uint))
+  (let (
+      (market-data (unwrap! (map-get? prediction-markets market-id) ERR_NOT_FOUND))
+      (user-position (unwrap!
+        (map-get? participant-positions {
+          market-id: market-id,
+          participant: tx-sender,
+        })
+        ERR_NOT_FOUND
+      ))
+    )
+    ;; Validate Claim Conditions
+    (asserts! (get is-settled market-data) ERR_MARKET_INACTIVE)
+    (asserts! (not (get rewards-claimed user-position)) ERR_REWARDS_CLAIMED)
+
+    (let (
+        (winning-direction (if (> (get closing-price market-data) (get opening-price market-data))
+          "bullish"
+          "bearish"
+        ))
+        (total-pool (+ (get bullish-pool market-data) (get bearish-pool market-data)))
+        (winning-pool (if (is-eq winning-direction "bullish")
+          (get bullish-pool market-data)
+          (get bearish-pool market-data)
+        ))
+      )
+      ;; Verify Winning Position
+      (asserts! (is-eq (get direction user-position) winning-direction)
+        ERR_INVALID_DIRECTION
+      )
+
+      ;; Calculate Reward Distribution
+      (let (
+          (gross-reward (/ (* (get amount user-position) total-pool) winning-pool))
+          (protocol-fee (/ (* gross-reward (var-get protocol-fee-bps)) u10000))
+          (net-reward (- gross-reward protocol-fee))
+        )
+        ;; Execute Transfers
+        (try! (as-contract (stx-transfer? net-reward (as-contract tx-sender) tx-sender)))
+        (try! (as-contract (stx-transfer? protocol-fee (as-contract tx-sender) CONTRACT_OWNER)))
+
+        ;; Update Claim Status
+        (map-set participant-positions {
+          market-id: market-id,
+          participant: tx-sender,
+        }
+          (merge user-position { rewards-claimed: true })
+        )
+        (ok net-reward)
+      )
+    )
+  )
+)
+
+;; ADMINISTRATIVE FUNCTIONS
+
+;; Update Oracle Principal
+(define-public (update-oracle (new-oracle principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq new-oracle (var-get oracle-principal)))
+      ERR_INVALID_INPUT
+    )
+    (ok (var-set oracle-principal new-oracle))
+  )
+)
+
+;; Adjust Minimum Stake Requirement
+(define-public (update-min-stake (new-minimum uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> new-minimum u0) ERR_INVALID_INPUT)
+    (ok (var-set min-stake-amount new-minimum))
+  )
+)
+
+;; Modify Protocol Fee Structure
+(define-public (update-protocol-fee (new-fee-bps uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-fee-bps u1000) ERR_INVALID_INPUT) ;; Max 10%
+    (ok (var-set protocol-fee-bps new-fee-bps))
+  )
+)
+
+;; Withdraw Accumulated Fees
+(define-public (withdraw-protocol-fees (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= amount (stx-get-balance (as-contract tx-sender)))
+      ERR_INSUFFICIENT_FUNDS
+    )
+    (try! (as-contract (stx-transfer? amount (as-contract tx-sender) CONTRACT_OWNER)))
+    (ok amount)
+  )
+)
+
+;; READ-ONLY QUERIES
+
+;; Retrieve Market Information
+(define-read-only (get-market-info (market-id uint))
+  (map-get? prediction-markets market-id)
+)
+
+;; Query User Position
+(define-read-only (get-user-position
+    (market-id uint)
+    (user principal)
+  )
+  (map-get? participant-positions {
+    market-id: market-id,
+    participant: user,
+  })
+)
+
+;; Check Protocol Configuration
+(define-read-only (get-protocol-config)
+  {
+    oracle: (var-get oracle-principal),
+    min-stake: (var-get min-stake-amount),
+    fee-bps: (var-get protocol-fee-bps),
+    next-market: (var-get next-market-id),
+  }
+)
+
+;; Get Contract Balance
+(define-read-only (get-contract-balance)
+  (stx-get-balance (as-contract tx-sender))
+)
